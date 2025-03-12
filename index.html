@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TensorFlow.js Model Prediction with Three.js</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #222;
+      color: #fff;
+    }
+    /* Блок с элементами управления (верстка в обычном потоке документа) */
+    #ui {
+      padding: 10px;
+      background: #444;
+    }
+    #ui input[type="file"],
+    #ui label,
+    #ui p {
+      display: block;
+      margin: 5px 0;
+    }
+    /* Обертка для 3D-сцены – фиксированный размер, расположенный ниже UI */
+    #scene-wrapper {
+      position: relative; /* для абсолютного позиционирования маски внутри */
+      width: 750px;
+      height: 750px;
+      margin: 20px auto; /* центрируем блок */
+      border: 1px solid #555;
+    }
+    /* Контейнер для Three.js канваса */
+    #container {
+      width: 100%;
+      height: 100%;
+    }
+    /* Маска располагается поверх канваса */
+    #mask-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://unpkg.com/es-module-shims@1.5.0/dist/es-module-shims.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+        "GLTFLoader": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/loaders/GLTFLoader.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <!-- Элементы управления – располагаются один под другим в обычном потоке -->
+  <div id="ui">
+    <input type="file" id="input-image" accept="image/*" capture="camera" />
+    <p id="position-result">Position:</p>
+    <p id="orientation-result">Orientation:</p>
+    <label for="toggle-plane">
+      <input type="checkbox" id="toggle-plane" checked /> Show Plane
+    </label>
+  </div>
+
+  <!-- Обертка для 3D-сцены -->
+  <div id="scene-wrapper">
+    <div id="container"></div>
+    <div id="mask-container"></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'GLTFLoader';
+
+    let model;
+    let camera, scene, renderer, plane;
+    let gltfModel;
+    let raycaster = new THREE.Raycaster();
+    let pointer = new THREE.Vector2();
+    let textureLoader = new THREE.TextureLoader();
+    let imgTexture;
+    let img;
+    let displayWidth, displayHeight;
+    let lastHit = new THREE.Vector3(0, 0, 0);
+    let type;
+    
+    let isDragging = false;
+
+    // Обновление координат указателя для рейкастера
+    function updatePointer(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    // Загрузка изображения
+    function loadImage(event) {
+      const reader = new FileReader();
+      reader.onload = function () {
+        img = document.createElement('img');
+        img.src = reader.result;
+        img.onload = function () {
+          const origWidth = img.naturalWidth;
+          const origHeight = img.naturalHeight;
+          // Всегда масштабируем так, чтобы максимальная сторона стала 750
+          const ratio = 750 / Math.max(origWidth, origHeight);
+          displayWidth = Math.round(origWidth * ratio);
+          displayHeight = Math.round(origHeight * ratio);
+
+          renderer.setSize(displayWidth, displayHeight);
+          camera.aspect = displayWidth / displayHeight;
+          camera.updateProjectionMatrix();
+
+          imgTexture = new THREE.Texture(img);
+          imgTexture.needsUpdate = true;
+          scene.background = imgTexture;
+          predict();
+        };
+      };
+      reader.readAsDataURL(event.target.files[0]);
+    }
+
+    async function loadModel() {
+      model = await tf.loadLayersModel('tfModelWeb/model.json');
+      console.log(model.outputNames);
+      console.log("Model loaded");
+    }
+
+    // Прогнозирование модели и построение маски
+    async function predict() {
+      if (!img) {
+        console.error("Image not loaded");
+        return;
+      }
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      canvas.width = 224;
+      canvas.height = 224;
+      ctx.drawImage(img, 0, 0, 224, 224);
+
+      const maskCanvas = document.createElement("canvas");
+      maskCanvas.width = 224;
+      maskCanvas.height = 224;
+      const maskCtx = maskCanvas.getContext("2d");
+
+      try {
+        let imageTensor = tf.browser.fromPixels(canvas, 3);
+        imageTensor = imageTensor.div(255.0);
+        imageTensor = imageTensor.expandDims();
+
+        const predictions = await model.predict(imageTensor);
+        console.log(predictions);
+
+        const position = predictions[0].dataSync()[0] * 300;
+        const orientation = predictions[2].dataSync()[0];
+        const orientationX = orientation * 90;
+        const orientationZ1 = predictions[1].dataSync()[0];
+        const orientationZ = ((((orientationZ1+1)/2) * 90) - 45)*-1;
+
+        const fov = predictions[4].dataSync()[0];
+        camera.fov = fov * 180;
+        camera.updateProjectionMatrix();
+
+        document.getElementById("position-result").innerText = `Position: ${position}`;
+        document.getElementById("orientation-result").innerText = `OrientationX: ${orientationX} OrientationZ: ${orientationZ}  fov: ${fov * 180}`;
+
+        updateScene(position, orientationX, orientationZ);
+
+        const unetMask = predictions[3];
+        const unetMaskArray = unetMask.dataSync();
+
+        const maskImageData = new ImageData(224, 224);
+        for (let i = 0; i < 224 * 224; i++) {
+          const value = unetMaskArray[i] * 255;
+          maskImageData.data[i * 4] = 0;
+          maskImageData.data[i * 4 + 1] = 0;
+          maskImageData.data[i * 4 + 2] = 0;
+          maskImageData.data[i * 4 + 3] = 255 - value;
+          //if (  unetMaskArray[i] < 0.5 ) {
+          //  maskImageData.data[i * 4 + 3] = 255;
+          //}
+        }
+        maskCtx.putImageData(maskImageData, 0, 0);
+
+        const upscaledMaskCanvas = document.createElement("canvas");
+        upscaledMaskCanvas.width = displayWidth;
+        upscaledMaskCanvas.height = displayHeight;
+        const upscaledMaskCtx = upscaledMaskCanvas.getContext("2d");
+        upscaledMaskCtx.imageSmoothingEnabled = true;
+        upscaledMaskCtx.imageSmoothingQuality = "high";
+        upscaledMaskCtx.drawImage(maskCanvas, 0, 0, displayWidth, displayHeight);
+
+        const highResCanvas = document.createElement("canvas");
+        highResCanvas.width = displayWidth;
+        highResCanvas.height = displayHeight;
+        const highResCtx = highResCanvas.getContext("2d");
+        highResCtx.imageSmoothingEnabled = true;
+        highResCtx.imageSmoothingQuality = "high";
+        highResCtx.drawImage(img, 0, 0, displayWidth, displayHeight);
+
+        const combinedCanvas = document.createElement("canvas");
+        combinedCanvas.width = displayWidth;
+        combinedCanvas.height = displayHeight;
+        const combinedCtx = combinedCanvas.getContext("2d");
+        combinedCtx.imageSmoothingEnabled = true;
+        combinedCtx.imageSmoothingQuality = "high";
+
+        combinedCtx.drawImage(highResCanvas, 0, 0, displayWidth, displayHeight);
+        combinedCtx.globalCompositeOperation = "destination-in";
+        combinedCtx.drawImage(upscaledMaskCanvas, 0, 0, displayWidth, displayHeight);
+
+        const maskContainer = document.getElementById("mask-container");
+        maskContainer.innerHTML = "";
+        maskContainer.appendChild(combinedCanvas);
+      } catch (error) {
+        console.error("Ошибка при выполнении предсказания:", error);
+      }
+    }
+
+    // Инициализация Three.js
+    function initThreeJS() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, 512 / 512, 0.1, 1000);
+      camera.position.z = 0;
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(512, 512);
+      document.getElementById("container").appendChild(renderer.domElement);
+
+      const texture = new THREE.TextureLoader().load("textureDefault.png");
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.RepeatWrapping;
+      texture.repeat.set(2, 2);
+
+      // Создание плоскости (реконструированный пол)
+      plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(16, 16),
+        new THREE.MeshBasicMaterial({
+          map: texture,
+          side: THREE.DoubleSide,
+          visible: true,
+        })
+      );
+      scene.add(plane);
+
+      document.getElementById("toggle-plane").addEventListener("change", (e) => {
+        plane.visible = e.target.checked;
+      });
+
+      // Загрузка GLTF-модели (ковер)
+      const loader = new GLTFLoader();
+      loader.load(
+        "https://vizbl-1.s3.eu-central-1.amazonaws.com/native/c83d2986-6e76-47d1-a193-620468e6b2fc.glb?version=5",
+        (gltf) => {
+          gltfModel = gltf.scene;
+          gltfModel.traverse((child) => {
+          if (child.isMesh) {
+            child.name = "move"; // или другое уникальное имя
+          }
+        });
+          scene.add(gltfModel);
+          gltfModel.scale.set(1, 1, 1);
+          // Добавляем квадрат для поворота модели
+          addRotationSquare(gltfModel);
+        }
+      );
+
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+      directionalLight.position.set(1, 1, 1).normalize();
+      scene.add(directionalLight);
+
+      document.getElementById("input-image").addEventListener("change", loadImage);
+
+      // Универсальные обработчики для ПК и мобильных устройств
+
+      let isDragging = false;
+      let lastHit = new THREE.Vector3(0, 0, 0);
+      let type;
+
+      // Функция для обновления координат указателя
+      function updatePointer(event) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      }
+
+      // Обработчик для начала перетаскивания
+      function onPointerDown(event) {
+        event.preventDefault(); // предотвращаем стандартное поведение
+        updatePointer(event);
+        raycaster.setFromCamera(pointer, camera);
+
+        let intersectsModel = [];
+        let targetIntersection;
+        if (gltfModel) {
+          intersectsModel = raycaster.intersectObject(gltfModel, true);
+          if (intersectsModel.length > 0) {
+            targetIntersection = intersectsModel.find(intersect => intersect.object.name === "move");
+            if (targetIntersection) {
+              type = "move";
+            } else {
+              type = "rotate";
+            }
+            isDragging = true;
+          }
+        }
+      }
+
+      // Обработчик для перемещения
+      function onPointerMove(event) {
+        if (!isDragging) return;
+        updatePointer(event);
+        raycaster.setFromCamera(pointer, camera);
+
+        const intersectsPlane = raycaster.intersectObject(plane);
+        if (intersectsPlane.length > 0 && gltfModel) {
+          if (lastHit.equals(new THREE.Vector3(0, 0, 0))) {
+            lastHit = intersectsPlane[0].point;
+          }
+
+          if (type === "move") {
+            const setPose = intersectsPlane[0].point.clone().sub(lastHit);
+            const localY = gltfModel.rotation.y;
+            gltfModel.position.add(setPose);
+            gltfModel.rotation.copy(plane.rotation);
+            gltfModel.rotateX(1.57);
+            gltfModel.rotation.y = localY;
+            lastHit = intersectsPlane[0].point;
+          }
+
+          if (type === "rotate") {
+            const currentPoint = intersectsPlane[0].point;
+            const pivot = gltfModel.position;
+            const v1 = lastHit.clone().sub(pivot);
+            const v2 = currentPoint.clone().sub(pivot);
+            const angle1 = Math.atan2(v1.y, v1.x);
+            const angle2 = Math.atan2(v2.y, v2.x);
+            const deltaAngle = angle2 - angle1;
+            gltfModel.rotation.y += deltaAngle;
+            lastHit.copy(currentPoint);
+          }
+        }
+      }
+
+      // Обработчик для завершения перетаскивания
+      function onPointerUp() {
+        isDragging = false;
+        lastHit = new THREE.Vector3(0, 0, 0);
+      }
+
+      // Добавление обработчиков событий для ПК и мобильных устройств
+      function addEventListeners() {
+        // События для мобильных устройств
+        renderer.domElement.addEventListener("touchstart", onPointerDown);
+        renderer.domElement.addEventListener("touchmove", onPointerMove);
+        renderer.domElement.addEventListener("touchend", onPointerUp);
+
+        // События для ПК
+        renderer.domElement.addEventListener("pointerdown", onPointerDown);
+        renderer.domElement.addEventListener("pointermove", onPointerMove);
+        renderer.domElement.addEventListener("pointerup", onPointerUp);
+
+        // Добавьте события для мыши для ПК (если требуется)
+        renderer.domElement.addEventListener("mousedown", onPointerDown);
+        renderer.domElement.addEventListener("mousemove", onPointerMove);
+        renderer.domElement.addEventListener("mouseup", onPointerUp);
+      }
+
+      // Инициализация событий
+      addEventListeners();
+
+
+
+      function animate() {
+        requestAnimationFrame(animate);
+        renderer.render(scene, camera);
+      }
+      animate();
+    }
+
+    function updateScene(position, orientationX, orientationZ) {
+      const radX = THREE.MathUtils.degToRad(orientationX);
+      const radZ = THREE.MathUtils.degToRad(orientationZ);
+      const direction = new THREE.Vector3(0, 0, -1);
+      const rotationX = new THREE.Matrix4().makeRotationX(radX);
+      const rotationZ = new THREE.Matrix4().makeRotationY(radZ);
+      direction.applyMatrix4(rotationX).applyMatrix4(rotationZ);
+      const cameraHeight = camera.position.z;
+      const heightOffset = position / 100;
+      plane.position.set(0, 0, cameraHeight - heightOffset);
+      plane.position.y += 2.5;
+      camera.rotation.set(0, 0, 0);
+      camera.rotateX(radX);
+      camera.rotateZ(radZ);
+      
+      gltfModel.position.copy(camera.position);
+      gltfModel.position.z = plane.position.z;
+      gltfModel.position.y += 2;
+      gltfModel.rotation.copy(plane.rotation);
+      gltfModel.rotateX(1.57);
+
+
+      //gltfModel.position.y += 2.5;
+    }
+
+    //////////// Добавленный код для поворота glTF-модели через квадрат ////////////
+
+    // Переменные для механики поворота через квадрат
+    let squareMesh;
+    let initialMouseAngle = 0;
+    let initialObjectRotationY = 0;
+
+    // Функция для создания квадрата, вписывающегося в модель
+    function addRotationSquare(object) {
+      // Вычисляем габариты объекта
+      const bbox = new THREE.Box3().setFromObject(object);
+      const size = bbox.getSize(new THREE.Vector3());
+      // Выбираем размер квадрата – максимальная из сторон по X и Z (если 0, то задаём 1)
+      const squareSize = Math.max(size.x, size.z) || 1;
+
+      // Создаем квадрат
+      const squareGeo = new THREE.PlaneGeometry(squareSize+0.3, squareSize+0.3);
+
+      // Загружаем текстуру с прозрачностью
+      const textureLoader = new THREE.TextureLoader();
+      const texture = textureLoader.load('rotate.png'); // замените путь на ваш PNG
+
+      const squareMat = new THREE.MeshBasicMaterial({ 
+        map: texture,
+        transparent: true, // включаем поддержку прозрачности
+        // opacity можно настроить по необходимости, либо убрать, если текстура уже содержит альфа-канал
+        side: THREE.DoubleSide 
+      });
+      squareMesh = new THREE.Mesh(squareGeo, squareMat);
+
+      
+      // Располагаем квадрат в центре модели (можно сместить по оси Z, чтобы он был виден)
+      squareMesh.position.set(0, 0, 0.001);
+      squareMesh.rotation.x = Math.PI / 2;
+
+      squareMesh.traverse((child) => {
+          if (child.isMesh) {
+            child.name = "rotate"; // или другое уникальное имя
+          }
+        });
+
+      // Добавляем квадрат как дочерний элемент модели
+      object.add(squareMesh);
+    }
+
+    loadModel();
+    initThreeJS();
+  </script>
+</body>
+</html>

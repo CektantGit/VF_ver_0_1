@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TensorFlow.js Model Prediction with Three.js – Постоянный захват кадра</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #222;
+      color: #fff;
+    }
+    /* Элементы управления */
+    #ui {
+      padding: 10px;
+      background: #444;
+    }
+    #ui p,
+    #ui label {
+      margin: 5px 0;
+    }
+    /* Обертка для 3D-сцены */
+    #scene-wrapper {
+      position: relative;
+      width: 512px;
+      height: 512px;
+      margin: 20px auto;
+      border: 1px solid #555;
+    }
+    #container {
+      width: 100%;
+      height: 100%;
+    }
+    #mask-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    /* Скрываем видео */
+    #video {
+      display: none;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://unpkg.com/es-module-shims@1.5.0/dist/es-module-shims.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+        "GLTFLoader": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/loaders/GLTFLoader.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <p id="position-result">Position:</p>
+    <p id="orientation-result">Orientation:</p>
+    <label for="toggle-plane">
+      <input type="checkbox" id="toggle-plane" checked /> Show Plane
+    </label>
+  </div>
+
+  <div id="scene-wrapper">
+    <div id="container"></div>
+    <div id="mask-container"></div>
+  </div>
+
+  <!-- Скрытый элемент video для получения потока -->
+  <video id="video" autoplay playsinline></video>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'GLTFLoader';
+
+    let model;
+    let camera, scene, renderer, plane, gltfModel;
+    let raycaster = new THREE.Raycaster();
+    let pointer = new THREE.Vector2();
+    let textureLoader = new THREE.TextureLoader();
+    let displayWidth, displayHeight;
+    let isDragging = false;
+
+    // Переменные для постоянного canvas и текстуры видео
+    let captureCanvas, captureCtx, videoTexture;
+
+    function updatePointer(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    async function startCamera() {
+      try {
+        const constraints = {
+  video: {
+    facingMode: {
+      ideal: "environment"
+    }
+  }
+};
+
+        const stream = await navigator.mediaDevices.getUserMedia(
+    {
+        video: { facingMode: { ideal: "environment" } },
+        audio: false
+    }
+);
+        const video = document.getElementById("video");
+        video.srcObject = stream;
+        await video.play();
+      } catch (error) {
+        console.error("Ошибка доступа к камере:", error);
+      }
+    }
+
+    async function loadModel() {
+      model = await tf.loadLayersModel('tfModelWeb/model.json');
+      console.log("Model loaded", model.outputNames);
+    }
+
+    function initThreeJS() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, 512 / 512, 0.1, 1000);
+      camera.position.z = 0;
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(512, 512);
+      document.getElementById("container").appendChild(renderer.domElement);
+
+      const texture = textureLoader.load("textureDefault.png");
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.RepeatWrapping;
+      texture.repeat.set(2, 2);
+
+      plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(16, 16),
+        new THREE.MeshBasicMaterial({
+          map: texture,
+          side: THREE.DoubleSide,
+          visible: true,
+        })
+      );
+      scene.add(plane);
+
+      document.getElementById("toggle-plane").addEventListener("change", (e) => {
+        plane.visible = e.target.checked;
+      });
+
+      const loader = new GLTFLoader();
+      loader.load(
+        "https://vizbl-1.s3.eu-central-1.amazonaws.com/native/0ca41af0-f223-4571-9548-830285b60c81.glb?version=7",
+        (gltf) => {
+          gltfModel = gltf.scene;
+          scene.add(gltfModel);
+          gltfModel.scale.set(1, 1, 1);
+        }
+      );
+
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+      directionalLight.position.set(1, 1, 1).normalize();
+      scene.add(directionalLight);
+
+      renderer.domElement.addEventListener("pointerdown", (event) => {
+        updatePointer(event);
+        raycaster.setFromCamera(pointer, camera);
+        let intersectsModel = [];
+        if (gltfModel) {
+          intersectsModel = raycaster.intersectObject(gltfModel, true);
+        }
+        if (intersectsModel.length > 0) {
+          isDragging = true;
+        } else {
+          const intersectsPlane = raycaster.intersectObject(plane);
+          if (intersectsPlane.length > 0 && gltfModel) {
+            gltfModel.position.copy(intersectsPlane[0].point);
+            gltfModel.rotation.copy(plane.rotation);
+            gltfModel.rotateX(1.57);
+          }
+          isDragging = true;
+        }
+      });
+
+      renderer.domElement.addEventListener("pointermove", (event) => {
+        if (!isDragging) return;
+        updatePointer(event);
+        raycaster.setFromCamera(pointer, camera);
+        const intersectsPlane = raycaster.intersectObject(plane);
+        if (intersectsPlane.length > 0 && gltfModel) {
+          gltfModel.position.copy(intersectsPlane[0].point);
+          gltfModel.rotation.copy(plane.rotation);
+          gltfModel.rotateX(1.57);
+        }
+      });
+
+      renderer.domElement.addEventListener("pointerup", () => {
+        isDragging = false;
+      });
+
+      function animate() {
+        requestAnimationFrame(animate);
+        renderer.render(scene, camera);
+      }
+      animate();
+    }
+
+    function updateScene(position, orientationX, orientationZ) {
+      const radX = THREE.MathUtils.degToRad(orientationX);
+      const radZ = THREE.MathUtils.degToRad(orientationZ);
+      const direction = new THREE.Vector3(0, 0, -1);
+      const rotationX = new THREE.Matrix4().makeRotationX(radX);
+      const rotationZ = new THREE.Matrix4().makeRotationY(radZ);
+      direction.applyMatrix4(rotationX).applyMatrix4(rotationZ);
+      const cameraHeight = camera.position.z;
+      const heightOffset = position / 100;
+      plane.position.set(0, 0, cameraHeight - heightOffset);
+      plane.position.y += 2.5;
+      camera.rotation.set(0, 0, 0);
+      camera.rotateX(radX);
+      camera.rotateZ(radZ);
+    }
+
+    async function processFrame() {
+      const video = document.getElementById("video");
+      if (video.readyState < 2) {
+        requestAnimationFrame(processFrame);
+        return;
+      }
+
+      // Если ещё не создан captureCanvas – создаём его и persistent videoTexture
+      if (!captureCanvas) {
+        captureCanvas = document.createElement("canvas");
+        captureCanvas.width = video.videoWidth;
+        captureCanvas.height = video.videoHeight;
+        captureCtx = captureCanvas.getContext("2d");
+        videoTexture = new THREE.Texture(captureCanvas);
+        videoTexture.needsUpdate = true;
+        scene.background = videoTexture;
+      }
+
+      // Обновляем размеры отображения (если нужно)
+      let ratio = 1;
+      if (video.videoWidth > 750 || video.videoHeight > 750) {
+        ratio = Math.min(750 / video.videoWidth, 750 / video.videoHeight);
+      }
+      displayWidth = Math.round(video.videoWidth * ratio);
+      displayHeight = Math.round(video.videoHeight * ratio);
+      renderer.setSize(displayWidth, displayHeight);
+      camera.aspect = displayWidth / displayHeight;
+      camera.updateProjectionMatrix();
+
+      // Захватываем кадр в captureCanvas и обновляем текстуру
+      captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+      videoTexture.needsUpdate = true;
+
+      // Создаём off‑screen canvas для подачи в нейросеть (224x224)
+      const nnCanvas = document.createElement("canvas");
+      nnCanvas.width = 224;
+      nnCanvas.height = 224;
+      const nnCtx = nnCanvas.getContext("2d");
+      nnCtx.drawImage(video, 0, 0, 224, 224);
+
+      try {
+        let imageTensor = tf.browser.fromPixels(nnCanvas, 3)
+          .div(255.0)
+          .expandDims();
+
+        const predictions = await model.predict(imageTensor);
+        console.log(predictions);
+
+        const position = predictions[0].dataSync()[0] * 300;
+        const orientation = predictions[2].dataSync()[0];
+        const orientationX = orientation * 90;
+        const orientationZ1 = predictions[1].dataSync()[0];
+        const orientationZ = (( ((orientationZ1+1)/2) * 90) - 45)*-1;
+
+        const fov = predictions[4].dataSync()[0];
+        camera.fov = fov * 180;
+        camera.updateProjectionMatrix();
+
+        document.getElementById("position-result").innerText = `Position: ${position}`;
+        document.getElementById("orientation-result").innerText = `OrientationX: ${orientationX} OrientationZ: ${orientationZ} fov: ${fov * 180}`;
+
+        updateScene(position, orientationX, orientationZ);
+
+        // Формируем маску из предсказания
+        const unetMask = predictions[3];
+        const unetMaskArray = unetMask.dataSync();
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = 224;
+        maskCanvas.height = 224;
+        const maskCtx = maskCanvas.getContext("2d");
+        const maskImageData = new ImageData(224, 224);
+        for (let i = 0; i < 224 * 224; i++) {
+          const value = unetMaskArray[i] * 255;
+          maskImageData.data[i * 4] = 0;
+          maskImageData.data[i * 4 + 1] = 0;
+          maskImageData.data[i * 4 + 2] = 0;
+          maskImageData.data[i * 4 + 3] = 255 - value;
+        }
+        maskCtx.putImageData(maskImageData, 0, 0);
+
+        // Масштабируем маску до размеров отображения
+        const upscaledMaskCanvas = document.createElement("canvas");
+        upscaledMaskCanvas.width = displayWidth;
+        upscaledMaskCanvas.height = displayHeight;
+        const upscaledMaskCtx = upscaledMaskCanvas.getContext("2d");
+        upscaledMaskCtx.imageSmoothingEnabled = true;
+        upscaledMaskCtx.imageSmoothingQuality = "high";
+        upscaledMaskCtx.drawImage(maskCanvas, 0, 0, displayWidth, displayHeight);
+
+        // Берём high‑res копию из captureCanvas (уже обновлённого)
+        const highResCanvas = document.createElement("canvas");
+        highResCanvas.width = displayWidth;
+        highResCanvas.height = displayHeight;
+        const highResCtx = highResCanvas.getContext("2d");
+        highResCtx.drawImage(captureCanvas, 0, 0, displayWidth, displayHeight);
+
+        // Комбинируем изображение с маской
+        const combinedCanvas = document.createElement("canvas");
+        combinedCanvas.width = displayWidth;
+        combinedCanvas.height = displayHeight;
+        const combinedCtx = combinedCanvas.getContext("2d");
+        combinedCtx.drawImage(highResCanvas, 0, 0, displayWidth, displayHeight);
+        combinedCtx.globalCompositeOperation = "destination-in";
+        combinedCtx.drawImage(upscaledMaskCanvas, 0, 0, displayWidth, displayHeight);
+
+        const maskContainer = document.getElementById("mask-container");
+        maskContainer.innerHTML = "";
+        maskContainer.appendChild(combinedCanvas);
+      } catch (error) {
+        console.error("Ошибка при выполнении предсказания:", error);
+      }
+
+      requestAnimationFrame(processFrame);
+    }
+
+    async function init() {
+      await loadModel();
+      initThreeJS();
+      await startCamera();
+      processFrame();
+    }
+    init();
+  </script>
+</body>
+</html>
